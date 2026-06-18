@@ -1,0 +1,21 @@
+node_modules/
+
+# FB 登入 cookie / 瀏覽器 profile — 絕不進版控
+.fb-profile/
+
+# config:只追蹤 *.sample 範本,實際設定(個人社團/條件)不進版控
+config/*
+!config/*.sample
+
+# 執行期資料(去重記錄、爬到的貼文),整個 data/ 不進版控
+data/
+
+# 爬取結果(FB 貼文資料,不進版控)
+output/
+
+# 機器專屬自動化(含絕對路徑)+ 執行 log
+fb-scan-cron.sh
+com.chriswang.fb-scan.plist
+fb-scan.log
+
+.DS_Store

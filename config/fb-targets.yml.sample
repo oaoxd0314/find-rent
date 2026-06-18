@@ -1,0 +1,74 @@
+# ── 範本 ──────────────────────────────────────────────────
+# 複製本檔成 config/fb-targets.yml 再填自己的設定:
+#   cp config/fb-targets.yml.sample config/fb-targets.yml
+# fb-scan.mjs 只讀 config/fb-targets.yml(本範本不會被讀)。
+
+# ── 1. TARGET:要爬哪些 FB 社團 ──────────────────────────
+groups:
+  - name: "社團顯示名稱"
+    url: "https://www.facebook.com/groups/XXXXXXXXXXXX/"
+    enabled: true
+    scroll: 20          # 往下滾幾次(抓多少貼文,越大越多越慢)
+    sort: "new"
+
+  # - name: "第二個社團"
+  #   url: "https://www.facebook.com/groups/YYYYYYYYYYYY/"
+  #   enabled: true
+  #   scroll: 20
+
+# ── 2. 條件 list ─────────────────────────────────────────
+# 每篇貼文分別比對每組,符合任一組就留下,並標註命中哪組。
+#   include  = 硬條件(租金 / 格局必須符合)
+#   exclude.keywords  = 命中就丟掉(物件特徵,如頂加 / 地下室 / 求租文)
+#   exclude.locations = 命中就丟掉(地名)
+#   must_have = 缺則標「待確認」(貼文常省略,不直接丟)
+#   optional  = 加分項,只報告
+#   preference = 軟條件(命中加註,如限女生)
+searches:
+
+  - name: "條件1:整層住家"
+    include:
+      rent_max: 33000              # 租金上限(0 或省略 = 不限)
+      layout:                       # 格局(符合任一;房型用房間數比對,1房1廳/一房一廳/2房1廳都認)
+        - "兩房一廳"
+        - "一房一廳"
+      must_have:
+        - "陽台"
+    exclude:
+      keywords:
+        - "頂加"
+        - "頂樓加蓋"
+        - "地下室"
+      locations:
+        - "三重"
+        - "蘆洲"
+    optional:
+      - "洗衣機"
+      - "冰箱"
+
+  - name: "條件2:女生友善"
+    include:
+      rent_min: 10000              # 租金下限
+      rent_max: 15000              # 租金上限
+      layout:
+        - "套房"
+        - "雅房(室友皆女生)"
+      preference:
+        - "只租女生"                # 命中會標 ⭐限女生
+    exclude:
+      keywords:
+        - "頂加"
+        - "頂樓加蓋"
+        - "地下室"
+        - "求租"
+      locations:
+        - "三重"
+        - "蘆洲"
+
+# ── 3. 去重(看過的貼文記這裡,不重複撈) ────────────────
+dedup_file: "data/fb-seen.tsv"
+
+# ── 4. 結果寫到哪 ─────────────────────────────────────────
+# 相對路徑 → 存在本專案 output/(已 gitignore)。也可填絕對路徑或 ~/...
+# 每天兩個檔:scan-YYYY-MM-DD.md(全部) / find-YYYY-MM-DD.md(命中)
+output_dir: "output"

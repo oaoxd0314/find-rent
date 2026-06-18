@@ -1,0 +1,17 @@
+{
+  "name": "find-rent",
+  "version": "1.0.0",
+  "description": "FB 租屋社團自動爬取 + 規則篩選(Playwright,零 LLM)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "scan": "node fb-scan.mjs",
+    "login": "node fb-scan.mjs --login",
+    "dry": "node fb-scan.mjs --dry-run",
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.1",
+    "playwright": "^1.61.0"
+  }
+}
