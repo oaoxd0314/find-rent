@@ -1,4 +1,6 @@
 node_modules/
+package-lock.json
+
 
 # FB 登入 cookie / 瀏覽器 profile — 絕不進版控
 .fb-profile/
