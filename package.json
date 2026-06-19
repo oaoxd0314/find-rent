@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "scan": "node fb-scan.mjs",
-    "login": "node fb-scan.mjs --login",
+    "fb-login": "node fb-scan.mjs --login",
     "dry": "node fb-scan.mjs --dry-run",
     "postinstall": "npx playwright install chromium"
   },

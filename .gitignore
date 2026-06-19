@@ -9,11 +9,11 @@ package-lock.json
 config/*
 !config/*.sample
 
-# 執行期資料(去重記錄、爬到的貼文),整個 data/ 不進版控
-data/
-
 # 爬取結果(FB 貼文資料,不進版控)
 output/
+
+# 去重紀錄(跨次執行記住看過的貼文)
+data/
 
 # 機器專屬自動化(含絕對路徑)+ 執行 log
 fb-scan-cron.sh
