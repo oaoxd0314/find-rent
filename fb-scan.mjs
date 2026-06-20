@@ -31,7 +31,13 @@ const PROFILE_DIR = path.join(ROOT, '.fb-profile');
 const CONFIG_PATH = path.join(ROOT, 'config', 'fb-targets.yml');
 
 const args = process.argv.slice(2);
+// --count N:覆寫滾動次數(沒給就用各 group 自己的 scroll)
+function flagValue(name) {
+  const i = args.indexOf(name);
+  return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : undefined;
+}
 const FLAGS = {
+  count: flagValue('--count'),
   login: args.includes('--login'),
   yes: args.includes('--yes'),
   headless: args.includes('--headless'),
@@ -52,7 +58,8 @@ function loadConfig() {
     process.exit(1);
   }
   const cfg = yaml.load(readFileSync(CONFIG_PATH, 'utf-8')) || {};
-  cfg.groups = Array.isArray(cfg.groups) ? cfg.groups.filter((g) => g && g.enabled !== false) : [];
+  cfg.groups = (Array.isArray(cfg.groups) ? cfg.groups.filter((g) => g && g.enabled !== false) : [])
+    .map((g) => ({ scroll: 12, ...g })); // scroll 預設 12,可在 config 各 group 覆寫
   cfg.searches = Array.isArray(cfg.searches) ? cfg.searches : [];
   cfg.output_dir = expandHome(cfg.output_dir || 'data/rent');
   cfg.dedup_file = cfg.dedup_file || 'data/fb-seen.tsv';
@@ -67,30 +74,53 @@ function expandHome(p) {
 }
 
 // ── rent parsing ─────────────────────────────────────────────────────
-// 從貼文文字抓出所有看起來像「月租」的金額(處理逗號、「萬」、元/月、NT$ 等)。
+// 全形 → 半形(數字、$、,、:、-… 一次轉掉),貼文常混全形數字「１５０００」。
+function toHalfWidth(s) {
+  return String(s)
+    .replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/　/g, ' ');
+}
+
+// 從貼文文字抓出所有看起來像「月租」的金額(處理全形、逗號、「萬」、元/月、NT$、區間 X-Y 等)。
+// 策略:有「明確標租金」的金額時只用那些(避開預算/押金/坪數等雜訊);否則才退而用一般疑似金額。
 export function parseRents(text) {
   if (!text) return [];
-  const t = String(text).replace(/，/g, ',').replace(/：/g, ':');
-  const found = new Set();
-  const push = (n) => { if (Number.isFinite(n) && n >= 3000 && n <= 300000) found.add(n); };
+  const t = toHalfWidth(text)
+    .replace(/，/g, ',').replace(/：/g, ':')
+    .replace(/[—–－~～〜]/g, '-'); // 各式破折號/波浪號 → 區間用的 -
+  const labeled = new Set(); // 明確標「租金/月租/房租/元月」的金額(可信)
+  const generic = new Set(); // 其他疑似金額(萬、$ 前綴…)
+  const valid = (n) => Number.isFinite(n) && n >= 3000 && n <= 300000;
+  const num = (s) => parseInt(String(s).replace(/,/g, ''), 10);
+  const add = (set, n) => { if (valid(n)) set.add(n); };
 
-  // x.x萬 / x萬
-  for (const m of t.matchAll(/([\d.]+)\s*萬/g)) push(Math.round(parseFloat(m[1]) * 10000));
-  // 租金/月租 後面接數字
-  for (const m of t.matchAll(/(?:租金|月租|房租)[^\d]{0,8}(\d[\d,]{2,})/g)) push(parseInt(m[1].replace(/,/g, ''), 10));
-  // 數字 + 元/月 或 /月
-  for (const m of t.matchAll(/(\d[\d,]{2,})\s*(?:元|NTD)?\s*\/?\s*月/g)) push(parseInt(m[1].replace(/,/g, ''), 10));
-  // NT$ / $ 前綴
-  for (const m of t.matchAll(/(?:NT\$|＄|\$)\s*(\d[\d,]{2,})/g)) push(parseInt(m[1].replace(/,/g, ''), 10));
+  // 標籤型:租金/月租/房租 後接金額,可為區間 X-Y(兩端都收)
+  for (const m of t.matchAll(/(?:租金|月租|房租)[^\d]{0,8}(\d[\d,]{2,})(?:\s*-\s*(\d[\d,]{2,}))?/g)) {
+    add(labeled, num(m[1]));
+    if (m[2]) add(labeled, num(m[2]));
+  }
+  // 標籤型:數字 + 元/月 或 /月,可為區間
+  for (const m of t.matchAll(/(\d[\d,]{2,})(?:\s*-\s*(\d[\d,]{2,}))?\s*(?:元|NTD)?\s*\/?\s*月/g)) {
+    add(labeled, num(m[1]));
+    if (m[2]) add(labeled, num(m[2]));
+  }
+  // 一般型:x.x萬 / x萬,可為區間(1.5萬-1.8萬 / 1.5-1.8萬)
+  for (const m of t.matchAll(/([\d.]+)\s*(?:-\s*([\d.]+)\s*)?萬/g)) {
+    add(generic, Math.round(parseFloat(m[1]) * 10000));
+    if (m[2]) add(generic, Math.round(parseFloat(m[2]) * 10000));
+  }
+  // 一般型:NT$ / $ 前綴
+  for (const m of t.matchAll(/(?:NT\$|\$)\s*(\d[\d,]{2,})/g)) add(generic, num(m[1]));
 
-  return [...found].sort((a, b) => a - b);
+  const pick = labeled.size ? labeled : generic;
+  return [...pick].sort((a, b) => a - b);
 }
 
 // ── 房間數語意比對 ───────────────────────────────────────────────────
 // 中文數字轉阿拉伯(只處理房型常見的 1~9 + 兩),讓「一大房一廳」「2房1廳」都能比。
 const CN_NUM = { 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
 function normNums(s) {
-  return String(s).replace(/[一二兩三四五六七八九]/g, (c) => CN_NUM[c]);
+  return toHalfWidth(s).replace(/[一二兩三四五六七八九]/g, (c) => CN_NUM[c]);
 }
 // 抓出文字中所有「N房」的房間數(N 緊鄰「房」,排除套房/雅房這種前面非數字的)
 function bedroomCounts(text) {
@@ -110,6 +140,26 @@ function matchLayout(text, kw) {
   return text.includes(core) ? core : null;
 }
 
+// ── 買賣文偵測 ───────────────────────────────────────────────────────
+// 租屋社團常混入售屋/仲介貼文。用關鍵字 + 大額「萬」總價判斷(月租不會以「萬」為單位喊到 ≥100 萬)。
+const SALE_KEYWORDS = /出售|售屋|自售|屋主自售|賞屋|總價|開價|委託價|權狀|實價登錄|買賣|售價|誠售|降價求售|物件編號/;
+export function looksLikeSale(text) {
+  const t = String(text || '').replace(/，/g, ',');
+  if (SALE_KEYWORDS.test(t)) return true;
+  for (const m of t.matchAll(/([\d.,]+)\s*萬/g)) {
+    if (parseFloat(m[1].replace(/,/g, '')) >= 100) return true; // ≥100 萬 → 幾乎都是買賣總價
+  }
+  return false;
+}
+
+// ── 求租文偵測 ───────────────────────────────────────────────────────
+// 「求租 / 徵租 / 求獨立套房 / 想找雅房…」這類找房文(非出租),逐字列關鍵字補不完,改用語意規則。
+const WANTED_KEYWORDS =
+  /求租|徵租|尋租|代租|急租(?!金)|找房|求屋|徵屋|預算|求[\s\S]{0,6}(?:套房|雅房|整層|分租|合租|公寓|住處|大?房)|(?:徵|想找|想租|找尋|誠徵|急徵|尋找|代尋)[\s\S]{0,8}(?:套房|雅房|整層|分租|合租|租屋|房子|住處)/;
+export function looksLikeWanted(text) {
+  return WANTED_KEYWORDS.test(String(text || '').replace(/，/g, ','));
+}
+
 // ── rule matcher ─────────────────────────────────────────────────────
 const FEMALE_ONLY = /限女|僅限女|只租女|女性限定|女生限定|限女性|女生公寓|女性宿|女生宿/;
 const FEMALE_ROOMMATES = /室友[^。\n]{0,25}(都是|皆|全為|全是)女|姊妹|姐妹/;
@@ -118,17 +168,23 @@ const NOT_FEMALE_ONLY = /不限男女|不限性別|男女[皆都]可/;
 // 回傳針對「一組條件」的判定:{ verdict: 'match'|'uncertain'|'reject', reasons, notes }
 export function evaluateSearch(post, search) {
   const text = post.text || '';
+  // 排除/買賣文判斷一律用未裁切的全文(body 會切掉開頭的「出售文」等標題)
+  const full = post.rawText || post.text || '';
   const inc = search.include || {};
   const exc = search.exclude || {};
   const reasons = [];
   const notes = [];
 
+  // 0) 買賣文 / 求租文 → 直接 reject(租屋社團常混入售屋、仲介、找房文)
+  if (looksLikeSale(full)) return { verdict: 'reject', reasons: ['買賣文(非租屋)'], notes };
+  if (looksLikeWanted(full)) return { verdict: 'reject', reasons: ['求租文(非出租)'], notes };
+
   // 1) 排除條件 → 直接 reject(keywords 與 locations 都檢查)
   for (const kw of exc.keywords || []) {
-    if (text.includes(kw)) return { verdict: 'reject', reasons: [`排除關鍵字:${kw}`], notes };
+    if (full.includes(kw)) return { verdict: 'reject', reasons: [`排除關鍵字:${kw}`], notes };
   }
   for (const loc of exc.locations || []) {
-    if (text.includes(loc)) return { verdict: 'reject', reasons: [`排除地點:${loc}`], notes };
+    if (full.includes(loc)) return { verdict: 'reject', reasons: [`排除地點:${loc}`], notes };
   }
 
   // 2) 租金
@@ -221,7 +277,7 @@ function appendSeen(file, keys, date) {
 
 // ── scraping (跑在頁面內,邏輯與手動驗證版一致) ──────────────────────
 async function scrapeGroup(page, group) {
-  const scrolls = Number(group.scroll) || 12;
+  const scrolls = Number(FLAGS.count || group.scroll);
   return await page.evaluate(async (scrolls) => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const harvested = new Map();
@@ -239,11 +295,19 @@ async function scrapeGroup(page, group) {
         const key = (body || text).replace(/\s+/g, '').slice(0, 60);
         if (!key || harvested.has(key)) continue;
         const listing = u.querySelector('a[href*="/commerce/listing/"]');
-        const a = u.querySelector('a[href*="/commerce/listing/"], a[href*="/groups/"][href*="__cft__"]');
+        // 優先抓「貼文本身」的連結(/posts/、/permalink/、商品頁),而非發文者個人頁(/user/)
+        const postA = u.querySelector(
+          'a[href*="/groups/"][href*="/posts/"], a[href*="/groups/"][href*="/permalink/"], a[href*="/commerce/listing/"]'
+        );
+        const authorA = u.querySelector('a[href*="/groups/"][href*="/user/"]');
+        // 去掉 query string,留乾淨可點的永久連結
+        const cleanUrl = (el) => (el ? el.href.split('?')[0].split('&')[0] : null);
         harvested.set(key, {
-          permalink: a ? a.href.split('&__tn__')[0].slice(0, 130) : null,
+          permalink: cleanUrl(postA),       // 貼文連結(抓不到時為 null)
+          author: cleanUrl(authorA),        // 發文者個人頁(備用)
           listing: listing ? (listing.innerText || '').replace(/\s+/g, ' ').trim() : null,
           text: (body || text).slice(0, 1200),
+          rawText: text.slice(0, 2000), // 未裁切的全文,供排除/買賣文判斷(body 會切掉開頭的「出售文」等標題)
         });
       }
     };
@@ -273,7 +337,8 @@ function renderEntry(post, cls) {
   if (cls.notes.length) lines.push(`- ${cls.notes.join(' · ')}`);
   const firstLine = (post.text || '').split('\n').find((s) => s.trim()) || '';
   lines.push(`- ${firstLine.slice(0, 80)}`);
-  if (post.permalink) lines.push(`- 發文者:${post.permalink}`);
+  if (post.permalink) lines.push(`- 貼文:${post.permalink}`);
+  if (post.author) lines.push(`- 發文者:${post.author}`);
   return lines.join('\n');
 }
 
@@ -285,17 +350,25 @@ function renderScanEntry(post, cls) {
     : (cls.notes.join(' · ') || cls.search);
   const firstLine = (post.text || '').split('\n').find((s) => s.trim()) || '';
   const lines = [`### ${icon} ${cls.search} — ${firstLine.slice(0, 60)}`, `- ${tail}`];
-  if (post.permalink) lines.push(`- ${post.permalink}`);
+  if (post.permalink) lines.push(`- 貼文:${post.permalink}`);
+  if (post.author) lines.push(`- 發文者:${post.author}`);
   return lines.join('\n');
 }
 
-// 寫日期檔:不存在 → 建檔(含標題);已存在(同日重跑)→ 追加一段時間戳區塊
-function writeDated(filePath, title, blocks) {
-  const time = new Date().toTimeString().slice(0, 5);
+// 逐社團即時寫檔,中途 ctrl+c 也保留已掃完的社團。
+// 本次執行第一次寫某檔(state[key] 還 false):檔案不存在 → 建檔(含標題);
+// 已存在(同日重跑)→ 先補一段時間戳分隔。之後同檔只接續 append。
+function appendSection(filePath, title, section, state, key) {
+  if (state[key]) {
+    appendFileSync(filePath, `\n${section}\n`, 'utf-8');
+    return;
+  }
+  state[key] = true;
   if (existsSync(filePath)) {
-    appendFileSync(filePath, `\n---\n## ⏱ ${time} 重跑新增\n\n${blocks.join('\n\n')}\n`, 'utf-8');
+    const time = new Date().toTimeString().slice(0, 5);
+    appendFileSync(filePath, `\n---\n## ⏱ ${time} 重跑新增\n\n${section}\n`, 'utf-8');
   } else {
-    writeFileSync(filePath, `${title}\n\n${blocks.join('\n\n')}\n`, 'utf-8');
+    writeFileSync(filePath, `${title}\n\n${section}\n`, 'utf-8');
   }
 }
 
@@ -332,14 +405,28 @@ async function main() {
     if (cfg.searches.length === 0) { console.error('fb-targets.yml 沒有 searches 條件。'); return; }
 
     const date = new Date().toISOString().slice(0, 10);
-    const seen = loadSeen(path.join(ROOT, cfg.dedup_file));
+    const seenFile = path.join(ROOT, cfg.dedup_file);
+    const seen = loadSeen(seenFile);
     const newKeys = [];
-    const findBlocks = []; // 命中(符合+待確認)
-    const scanBlocks = []; // 全部新貼文(原始+判定)
+    const findBlocks = []; // 命中(符合+待確認),僅供 --dry-run 彙總印出
     let totalScraped = 0, totalNew = 0, totalMatch = 0, totalUncertain = 0;
     let confirmed = false; // 只在第一個社團確認一次
 
+    const scanPath = path.join(cfg.output_dir, `scan-${date}.md`);
+    const findPath = path.join(cfg.output_dir, `find-${date}.md`);
+    const wrote = {}; // 本次執行已寫過哪些檔(給 appendSection 判斷建檔/重跑分隔)
+    if (!FLAGS.dryRun) mkdirSync(cfg.output_dir, { recursive: true });
+
+    // 優雅中斷:第一次 ctrl+c → 跑完目前社團、寫檔後才停;第二次 → 強制結束
+    let stopRequested = false;
+    process.on('SIGINT', () => {
+      if (stopRequested) { console.log('\n強制中止。'); process.exit(130); }
+      stopRequested = true;
+      console.log('\n⏹  收到中斷,跑完目前社團、寫檔後就停(再按一次 ctrl+c 強制結束)…');
+    });
+
     for (const group of cfg.groups) {
+      if (stopRequested) break;
       console.log(`\n📍 ${group.name} — ${group.url}`);
       await page.goto(group.url, { waitUntil: 'domcontentloaded' });
       await sleep(2500);
@@ -355,18 +442,18 @@ async function main() {
         confirmed = true;
       }
 
-      console.log(`   滾動抓取中(scroll=${group.scroll || 12})…`);
+      console.log(`   滾動抓取中(scroll=${FLAGS.count || group.scroll})…`);
       const posts = await scrapeGroup(page, group);
       totalScraped += posts.length;
 
       const groupFinds = [];
       const groupScans = [];
-      let groupNew = 0;
+      const groupKeys = [];
       for (const post of posts) {
         const key = postKey(post);
         if (seen.has(key) || newKeys.includes(key)) continue; // 去重
-        newKeys.push(key);
-        totalNew++; groupNew++;
+        newKeys.push(key); groupKeys.push(key);
+        totalNew++;
         const cls = classifyPost(post, cfg.searches);
         if (cls.verdict === 'match') totalMatch++;
         else if (cls.verdict === 'uncertain') totalUncertain++;
@@ -375,10 +462,15 @@ async function main() {
           groupFinds.push(renderEntry(post, cls));
         }
       }
-
       if (groupFinds.length) findBlocks.push(`## ${group.name}\n\n${groupFinds.join('\n\n')}`);
-      if (groupScans.length) scanBlocks.push(`## ${group.name}\n\n${groupScans.join('\n\n')}`);
-      console.log(`   抓到 ${posts.length} 篇,去重後新增 ${groupNew},符合+待確認 ${groupFinds.length}`);
+      console.log(`   抓到 ${posts.length} 篇,去重後新增 ${groupKeys.length},符合+待確認 ${groupFinds.length}`);
+
+      // 逐社團即時寫檔 + 記去重,中途 ctrl+c 也保留已掃完的社團
+      if (!FLAGS.dryRun) {
+        if (groupScans.length) appendSection(scanPath, `# 掃描全紀錄 ${date}`, `## ${group.name}\n\n${groupScans.join('\n\n')}`, wrote, 'scan');
+        if (groupFinds.length) appendSection(findPath, `# 篩選命中 ${date}`, `## ${group.name}\n\n${groupFinds.join('\n\n')}`, wrote, 'find');
+        appendSeen(seenFile, groupKeys, date);
+      }
     }
 
     console.log(`\n${'━'.repeat(40)}`);
@@ -394,19 +486,10 @@ async function main() {
       return;
     }
 
-    // 寫兩個日期檔到 output_dir:scan-<date>.md(全部)、find-<date>.md(命中)
-    mkdirSync(cfg.output_dir, { recursive: true });
-    if (scanBlocks.length) {
-      writeDated(path.join(cfg.output_dir, `scan-${date}.md`), `# 掃描全紀錄 ${date}`, scanBlocks);
-      console.log(`\n→ 全紀錄:${path.join(cfg.output_dir, `scan-${date}.md`)}`);
-    }
-    if (findBlocks.length) {
-      writeDated(path.join(cfg.output_dir, `find-${date}.md`), `# 篩選命中 ${date}`, findBlocks);
-      console.log(`→ 命中清單:${path.join(cfg.output_dir, `find-${date}.md`)}`);
-    } else {
-      console.log('\n沒有新的符合物件。');
-    }
-    appendSeen(path.join(ROOT, cfg.dedup_file), newKeys, date);
+    // 寫檔與去重都已在各社團逐一完成,這裡只回報結果
+    if (wrote.scan) console.log(`\n→ 全紀錄:${scanPath}`);
+    if (wrote.find) console.log(`→ 命中清單:${findPath}`);
+    else console.log('\n沒有新的符合物件。');
   } finally {
     await context.close();
   }
