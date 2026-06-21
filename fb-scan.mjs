@@ -175,6 +175,13 @@ export function looksLikeWanted(text) {
 const FEMALE_ONLY = /限女|僅限女|只租女|女性限定|女生限定|限女性|女生公寓|女性宿|女生宿/;
 const FEMALE_ROOMMATES = /室友[^。\n]{0,25}(都是|皆|全為|全是)女|姊妹|姐妹/;
 const NOT_FEMALE_ONLY = /不限男女|不限性別|男女[皆都]可/;
+// 男性訊號(積極版):限男、男室友、分房清單裡的男性住戶(男生/男性/男業務…)。
+// 每個「男」都加 (?!女) 排除「男女不拘/不限男女/適合男女」這種開放語意(那些是 男女 連寫)。
+const MALE_ONLY = /限男(?!女)|僅限男|只租男|只收男|男性限定|男生限定|限男性/;
+const MALE_ROOMMATE =
+  /男(?:室友|房客|住戶)|室友[^。\n]{0,25}(?:都是|皆|全為|全是)男(?!女)|(?:room|房間?|[A-Za-z]室)\s*[A-Za-z0-9]?[\s:：.\-、]{0,3}[^。\n]{0,10}男(?!女)|男(?:生|性|業務|上班族|工程師|學生)(?!女)/i;
+// 否定/女生優先:出現「不要男/不收男/謝絕男/徵女/限女」這類 → 其實是女生友善,maleSignal 抑制掉
+const ANTI_MALE = /不要男|不收男|不租男|勿男|非男|謝絕男|男(?:生|性|士)?勿|限女|僅限女|只租女|徵女|女性限定|女生限定/;
 
 // 從一篇貼文抽出「與條件無關」的結構化欄位,存進 scan jsonl(資料層)。
 // 與 config 有關的字串比對(地點/關鍵字/must_have/optional)不在這裡 ——
@@ -191,6 +198,8 @@ export function extractMeta(post) {
     femaleOnly: FEMALE_ONLY.test(text),
     femaleRoommates: FEMALE_ROOMMATES.test(text),
     notFemaleOnly: NOT_FEMALE_ONLY.test(text),
+    // 限男 / 男室友 / 分房清單有男;但出現否定或女生友善訊號(不要男/徵女/限女…)則抑制
+    maleSignal: (MALE_ONLY.test(text) || MALE_ROOMMATE.test(text)) && !ANTI_MALE.test(text),
   };
 }
 
@@ -200,16 +209,18 @@ export function extractMeta(post) {
 //   - include 條件(地點/租金/格局/must_have)全符合 → match
 //   - 沒命中 exclude,但 include 有缺 → uncertain(待確認,留給人工看)
 // 也就是 include 全是「軟條件」:不滿足只降級待確認,不再直接 reject。
-// post.meta 若已存在(來自 scan jsonl)就直接用,否則臨場 extractMeta(向後相容)。
+// meta 一律用當前 code 從 text 重新推導(不信 jsonl 裡的快取)——
+// 這樣調整偵測邏輯後 --refilter 會立刻反映,不必重爬;jsonl 的 meta 只供人工檢視。
 export function evaluateSearch(post, search) {
   const text = post.text || '';
   const full = post.rawText || post.text || '';
-  const meta = post.meta || extractMeta(post);
+  const meta = extractMeta(post);
   const inc = search.include || {};
   const exc = search.exclude || {};
   const reasons = [];
   const notes = [];
   let uncertain = false; // 任一 include 條件沒滿足就降級待確認
+  let genderFlag = false; // 偵測到男性訊號(roommate_male)→ 獨立的 gender 層級,不靜默丟掉
 
   // 0) 買賣文 / 求租文 → 直接 reject(租屋社團常混入售屋、仲介、找房文)
   if (meta.isSale) return { verdict: 'reject', reasons: ['買賣文(非租屋)'], notes };
@@ -221,6 +232,12 @@ export function evaluateSearch(post, search) {
   }
   for (const loc of exc.locations || []) {
     if (full.includes(loc)) return { verdict: 'reject', reasons: [`排除地點:${loc}`], notes };
+  }
+  // 室友性別:exclude.roommate_male=true(女生友善)時,偵測到男性訊號 → 標 gender(待性別確認)
+  // 不直接 reject,避免積極偵測的誤判被靜默丟掉;其餘 include 條件照常算,notes 一起帶出來。
+  if (exc.roommate_male && meta.maleSignal) {
+    genderFlag = true;
+    notes.push('🚻 偵測到男性訊號');
   }
 
   // 1b) 指定地點:沒命中 → 待確認(不 reject)
@@ -255,11 +272,8 @@ export function evaluateSearch(post, search) {
     else { uncertain = true; notes.push(`格局?不符(要 ${layouts.join('/')})`); }
   }
 
-  // 3b) 雅房特例:雅房需室友皆女生,否則 uncertain
-  if (coreLayout === '雅房') {
-    if (meta.femaleOnly || meta.femaleRoommates) notes.push('室友女生/限女 ✓');
-    else uncertain = true;
-  }
+  // 室友皆女:純裝飾性標註,不影響判定(女生友善的硬性踢除已在 exclude.roommate_male 處理)
+  if (meta.femaleRoommates) notes.push('室友皆女 ✓');
 
   // 4) must_have(缺則 uncertain — 貼文常省略)
   for (const need of inc.must_have || []) {
@@ -276,15 +290,20 @@ export function evaluateSearch(post, search) {
     if (text.includes(opt)) notes.push(`+${opt}`);
   }
 
+  if (genderFlag) return { verdict: 'gender', reasons, notes };
   return { verdict: uncertain ? 'uncertain' : 'match', reasons, notes };
 }
+
+// classifyPost 取最佳判定的排序:match > gender > uncertain > reject。
+// gender 高於 uncertain,否則男訊號貼文會被其他條件的 uncertain 蓋掉、浮不上 🚻 區。
+const VERDICT_RANK = { match: 4, gender: 3, uncertain: 2, reject: 1 };
 
 // 把一篇貼文跑過所有條件,回傳最佳結果
 function classifyPost(post, searches) {
   let best = null;
   for (const s of searches) {
     const r = evaluateSearch(post, s);
-    const rank = { match: 3, uncertain: 2, reject: 1 }[r.verdict];
+    const rank = VERDICT_RANK[r.verdict];
     if (!best || rank > best.rank) best = { ...r, rank, search: s.name };
     if (r.verdict === 'match') break;
   }
@@ -374,10 +393,13 @@ function previewLine(text) {
   return good || lines[0] || '';
 }
 
+const VERDICT_ICON = { match: '✅', uncertain: '〽️', gender: '🚻', reject: '⛔' };
+const VERDICT_SUFFIX = { match: '', uncertain: '(待確認)', gender: '(性別待確認)', reject: '(已排除)' };
+
 function renderEntry(post, cls) {
-  const head = cls.verdict === 'match' ? '✅' : '〽️';
-  const tag = cls.verdict === 'match' ? cls.search : `${cls.search}(待確認)`;
-  const lines = [`### ${head} [${tag}]`];
+  const head = VERDICT_ICON[cls.verdict] || '〽️';
+  const groupTag = post.group ? ` · ${post.group}` : '';
+  const lines = [`### ${head} [${cls.search}${VERDICT_SUFFIX[cls.verdict] || ''}]${groupTag}`];
   if (cls.notes.length) lines.push(`- ${cls.notes.join(' · ')}`);
   lines.push(`- ${previewLine(post.text).slice(0, 80)}`);
   if (post.permalink) lines.push(`- 貼文:${post.permalink}`);
@@ -406,24 +428,34 @@ function readScanRecords(file) {
   return out;
 }
 
-// 讀 scan 記錄 → 套 config 篩選 → 依社團分組的命中清單 + 統計。不碰瀏覽器。
+// find 收錄的層級(由好到差);reject 不入 find,留在 scan jsonl 資料層。
+const FIND_TIERS = ['match', 'uncertain', 'gender'];
+const TIER_TITLE = { match: '## ✅ 符合', uncertain: '## 〽️ 待確認', gender: '## 🚻 性別待確認' };
+
+// 讀 scan 記錄 → 套 config 篩選 → 依判定層級分區的命中清單 + 統計。不碰瀏覽器。
 function runFilter(records, searches) {
-  const groups = new Map(); // 社團名 → entry markdown[]
-  let match = 0, uncertain = 0;
+  const tiers = { match: [], uncertain: [], gender: [] };
   for (const rec of records) {
     const cls = classifyPost(rec, searches);
-    if (cls.verdict !== 'match' && cls.verdict !== 'uncertain') continue;
-    if (cls.verdict === 'match') match++; else uncertain++;
-    const g = rec.group || '(未分類)';
-    if (!groups.has(g)) groups.set(g, []);
-    groups.get(g).push(renderEntry(rec, cls));
+    if (!tiers[cls.verdict]) continue; // 只收 match/uncertain/gender
+    tiers[cls.verdict].push({ group: rec.group || '(未分類)', md: renderEntry(rec, cls) });
   }
-  return { groups, match, uncertain };
+  return { tiers, match: tiers.match.length, uncertain: tiers.uncertain.length, gender: tiers.gender.length };
 }
+// find 檔:依層級分區(✅→〽️→🚻),每區內再按社團排序。
 function writeFind(file, date, result) {
-  const blocks = [];
-  for (const [g, entries] of result.groups) blocks.push(`## ${g}\n\n${entries.join('\n\n')}`);
-  writeFileSync(file, `# 篩選命中 ${date}\n\n${blocks.join('\n\n')}\n`, 'utf-8');
+  const out = [
+    `# 篩選命中 ${date}`,
+    '',
+    `✅ 符合 ${result.match} · 〽️ 待確認 ${result.uncertain} · 🚻 性別待確認 ${result.gender}`,
+  ];
+  for (const tier of FIND_TIERS) {
+    const entries = result.tiers[tier];
+    if (!entries.length) continue;
+    entries.sort((a, b) => a.group.localeCompare(b.group, 'zh-Hant'));
+    out.push('', TIER_TITLE[tier], '', entries.map((e) => e.md).join('\n\n'));
+  }
+  writeFileSync(file, out.join('\n') + '\n', 'utf-8');
 }
 
 async function isLoggedIn(page) {
@@ -451,7 +483,7 @@ async function main() {
     const result = runFilter(records, cfg.searches);
     const findPath = findMdPath(cfg.output_dir, date);
     writeFind(findPath, date, result);
-    console.log(`重跑篩選 ${date}:讀 ${records.length} 篇 → ✅ 符合 ${result.match} · 〽️ 待確認 ${result.uncertain}`);
+    console.log(`重跑篩選 ${date}:讀 ${records.length} 篇 → ✅ 符合 ${result.match} · 〽️ 待確認 ${result.uncertain} · 🚻 性別待確認 ${result.gender}`);
     console.log(`→ 命中清單:${findPath}`);
     return;
   }
@@ -544,18 +576,21 @@ async function main() {
     console.log(`掃描完成 ${date}`);
     console.log(`  總抓取:${totalScraped} 篇`);
     console.log(`  去重後新貼文:${allRecords.length} 篇`);
-    console.log(`  ✅ 符合:${result.match} · 〽️ 待確認:${result.uncertain}`);
+    console.log(`  ✅ 符合:${result.match} · 〽️ 待確認:${result.uncertain} · 🚻 性別待確認:${result.gender}`);
 
     if (FLAGS.dryRun) {
       console.log('\n(--dry-run,不寫檔)\n');
       const blocks = [];
-      for (const [g, entries] of result.groups) blocks.push(`## ${g}\n\n${entries.join('\n\n')}`);
+      for (const tier of FIND_TIERS) {
+        const entries = result.tiers[tier];
+        if (entries.length) blocks.push(`${TIER_TITLE[tier]}\n\n${entries.map((e) => e.md).join('\n\n')}`);
+      }
       console.log(blocks.length ? blocks.join('\n\n') : '(無命中物件)');
       return;
     }
 
     if (allRecords.length) console.log(`\n→ 掃描資料:${scanPath}`);
-    if (result.match || result.uncertain) {
+    if (result.match || result.uncertain || result.gender) {
       writeFind(findPath, date, result);
       console.log(`→ 命中清單:${findPath}`);
     } else {
