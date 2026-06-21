@@ -14,6 +14,13 @@
  *   node fb-scan.mjs --yes          # 不問,確認登入就直接爬(排程用)
  *   node fb-scan.mjs --headless     # 無頭模式(排程用,需 profile 已登入)
  *   node fb-scan.mjs --dry-run      # 爬+篩但不寫檔,結果印在終端機
+ *   node fb-scan.mjs --renew        # 跳過跨次去重(fb-seen 不擋),強制重新拿到結果
+ *   node fb-scan.mjs --refilter     # 不開瀏覽器,只用今天的 scan jsonl 重跑篩選
+ *   node fb-scan.mjs --refilter 2026-06-21   # 指定日期重跑篩選
+ *
+ * 資料流:scan(動瀏覽器,抓 + 抽 meta)→ scan-YYYY-MM-DD.jsonl(SSOT,機器用)
+ *         → filter(套 config 判斷)→ find-YYYY-MM-DD.md(人眼看的命中清單)。
+ * 改了 config 不必重爬,--refilter 直接從 jsonl 重生 find。
  *
  * 純 Node + Playwright + js-yaml(都已是 repo 依賴)。不呼叫任何 LLM、不需 API key。
  */
@@ -42,6 +49,9 @@ const FLAGS = {
   yes: args.includes('--yes'),
   headless: args.includes('--headless'),
   dryRun: args.includes('--dry-run'),
+  refilter: args.includes('--refilter'),  // 只重跑篩選(讀現有 scan jsonl),不開瀏覽器
+  refilterDate: flagValue('--refilter'),  // --refilter 2026-06-21,沒給就用今天
+  renew: args.includes('--renew'),        // 跳過跨次去重,強制重新拿到結果(當天 jsonl 重寫)
 };
 
 // ── small helpers ────────────────────────────────────────────────────
@@ -129,11 +139,12 @@ function bedroomCounts(text) {
   return set;
 }
 // 一個 layout 關鍵字若含「房…廳」→ 用房間數比對;否則用字面(套房/雅房/整層)
-function matchLayout(text, kw) {
+// haveBedrooms:文中房間數(scan 階段預存的 meta.bedrooms),沒給才臨場算。
+function matchLayout(text, kw, haveBedrooms) {
   const core = kw.replace(/[（(].*$/, '').trim();
   if (/房[\s\S]*廳/.test(core)) {
     const want = bedroomCounts(core);
-    const have = bedroomCounts(text);
+    const have = haveBedrooms ? new Set(haveBedrooms) : bedroomCounts(text);
     for (const n of want) if (have.has(n)) return core;
     return null;
   }
@@ -165,21 +176,46 @@ const FEMALE_ONLY = /限女|僅限女|只租女|女性限定|女生限定|限女
 const FEMALE_ROOMMATES = /室友[^。\n]{0,25}(都是|皆|全為|全是)女|姊妹|姐妹/;
 const NOT_FEMALE_ONLY = /不限男女|不限性別|男女[皆都]可/;
 
-// 回傳針對「一組條件」的判定:{ verdict: 'match'|'uncertain'|'reject', reasons, notes }
-export function evaluateSearch(post, search) {
+// 從一篇貼文抽出「與條件無關」的結構化欄位,存進 scan jsonl(資料層)。
+// 與 config 有關的字串比對(地點/關鍵字/must_have/optional)不在這裡 ——
+// 那些必須在篩選當下對「當時的 config」算,否則改 config 就得重爬。
+export function extractMeta(post) {
   const text = post.text || '';
   // 排除/買賣文判斷一律用未裁切的全文(body 會切掉開頭的「出售文」等標題)
   const full = post.rawText || post.text || '';
+  return {
+    rents: parseRents(text),
+    bedrooms: [...bedroomCounts(text)], // 文中所有「N房」的房間數
+    isSale: looksLikeSale(full),
+    isWanted: looksLikeWanted(full),
+    femaleOnly: FEMALE_ONLY.test(text),
+    femaleRoommates: FEMALE_ROOMMATES.test(text),
+    notFemaleOnly: NOT_FEMALE_ONLY.test(text),
+  };
+}
+
+// 回傳針對「一組條件」的判定:{ verdict: 'match'|'uncertain'|'reject', reasons, notes }
+// 判定哲學:
+//   - 命中 exclude(關鍵字/地點)或買賣/求租文 → reject(唯一會被踢掉的情況)
+//   - include 條件(地點/租金/格局/must_have)全符合 → match
+//   - 沒命中 exclude,但 include 有缺 → uncertain(待確認,留給人工看)
+// 也就是 include 全是「軟條件」:不滿足只降級待確認,不再直接 reject。
+// post.meta 若已存在(來自 scan jsonl)就直接用,否則臨場 extractMeta(向後相容)。
+export function evaluateSearch(post, search) {
+  const text = post.text || '';
+  const full = post.rawText || post.text || '';
+  const meta = post.meta || extractMeta(post);
   const inc = search.include || {};
   const exc = search.exclude || {};
   const reasons = [];
   const notes = [];
+  let uncertain = false; // 任一 include 條件沒滿足就降級待確認
 
   // 0) 買賣文 / 求租文 → 直接 reject(租屋社團常混入售屋、仲介、找房文)
-  if (looksLikeSale(full)) return { verdict: 'reject', reasons: ['買賣文(非租屋)'], notes };
-  if (looksLikeWanted(full)) return { verdict: 'reject', reasons: ['求租文(非出租)'], notes };
+  if (meta.isSale) return { verdict: 'reject', reasons: ['買賣文(非租屋)'], notes };
+  if (meta.isWanted) return { verdict: 'reject', reasons: ['求租文(非出租)'], notes };
 
-  // 1) 排除條件 → 直接 reject(keywords 與 locations 都檢查)
+  // 1) 排除條件 → 直接 reject(keywords 與 locations 都檢查)—— 唯一的硬性踢除
   for (const kw of exc.keywords || []) {
     if (full.includes(kw)) return { verdict: 'reject', reasons: [`排除關鍵字:${kw}`], notes };
   }
@@ -187,60 +223,60 @@ export function evaluateSearch(post, search) {
     if (full.includes(loc)) return { verdict: 'reject', reasons: [`排除地點:${loc}`], notes };
   }
 
-  // 2) 租金
-  const rents = parseRents(text);
+  // 1b) 指定地點:沒命中 → 待確認(不 reject)
+  const incLocs = inc.locations || [];
+  if (incLocs.length) {
+    const hitLoc = incLocs.find((loc) => full.includes(loc));
+    if (hitLoc) notes.push(`地點:${hitLoc}`);
+    else { uncertain = true; notes.push(`地點?不在範圍(要 ${incLocs.join('/')})`); }
+  }
+
+  // 2) 租金:超出範圍或抓不到 → 待確認(不 reject)
+  const rents = meta.rents || [];
   const min = inc.rent_min ?? 0;
   const max = inc.rent_max ?? Infinity;
-  let rentOk = null; // null = 抓不到租金
   if (rents.length) {
     const hit = rents.find((r) => r >= min && r <= max);
-    rentOk = !!hit;
     if (hit) notes.push(`租金 ${hit.toLocaleString()}`);
-    else reasons.push(`租金不在 ${min || 0}~${max === Infinity ? '∞' : max}(抓到 ${rents.map((r) => r.toLocaleString()).join('/')})`);
+    else { uncertain = true; notes.push(`租金?不在 ${min || 0}~${max === Infinity ? '∞' : max}(抓到 ${rents.map((r) => r.toLocaleString()).join('/')})`); }
   } else {
-    notes.push('租金未明');
+    uncertain = true; notes.push('租金未明');
   }
-  if (rentOk === false) return { verdict: 'reject', reasons, notes };
 
-  // 3) 格局關鍵字(核心,缺則 reject)
+  // 3) 格局:沒命中 → 待確認(不 reject)
   const layouts = inc.layout || [];
   let coreLayout = null;
   if (layouts.length) {
     for (const kw of layouts) {
-      const hit = matchLayout(text, kw);
+      const hit = matchLayout(text, kw, meta.bedrooms);
       if (hit) { coreLayout = hit; break; }
     }
-    if (!coreLayout) return { verdict: 'reject', reasons: [...reasons, `格局不符(要 ${layouts.join('/')})`], notes };
-    notes.push(`格局:${coreLayout}`);
+    if (coreLayout) notes.push(`格局:${coreLayout}`);
+    else { uncertain = true; notes.push(`格局?不符(要 ${layouts.join('/')})`); }
   }
 
   // 3b) 雅房特例:雅房需室友皆女生,否則 uncertain
-  let femaleUncertain = false;
   if (coreLayout === '雅房') {
-    if (FEMALE_ONLY.test(text) || FEMALE_ROOMMATES.test(text)) notes.push('室友女生/限女 ✓');
-    else femaleUncertain = true;
+    if (meta.femaleOnly || meta.femaleRoommates) notes.push('室友女生/限女 ✓');
+    else uncertain = true;
   }
 
-  // 4) must_have(缺則 uncertain,不直接 reject — 貼文常省略)
-  let mustMissing = false;
+  // 4) must_have(缺則 uncertain — 貼文常省略)
   for (const need of inc.must_have || []) {
     if (text.includes(need)) notes.push(`${need} ✓`);
-    else { mustMissing = true; notes.push(`${need}?(未提及)`); }
+    else { uncertain = true; notes.push(`${need}?(未提及)`); }
   }
 
   // 5) preference / 女生限定(軟條件,加註)
-  if (FEMALE_ONLY.test(text)) notes.push('⭐限女生');
-  else if (NOT_FEMALE_ONLY.test(text) && (search.include?.preference || []).length) notes.push('註:不限男女');
+  if (meta.femaleOnly) notes.push('⭐限女生');
+  else if (meta.notFemaleOnly && (inc.preference || []).length) notes.push('註:不限男女');
 
   // 6) optional(軟條件,只報告)
   for (const opt of search.optional || []) {
     if (text.includes(opt)) notes.push(`+${opt}`);
   }
 
-  if (rentOk === null || mustMissing || femaleUncertain) {
-    return { verdict: 'uncertain', reasons, notes };
-  }
-  return { verdict: 'match', reasons, notes };
+  return { verdict: uncertain ? 'uncertain' : 'match', reasons, notes };
 }
 
 // 把一篇貼文跑過所有條件,回傳最佳結果
@@ -330,46 +366,64 @@ async function scrapeGroup(page, group) {
 }
 
 // ── output ───────────────────────────────────────────────────────────
+// 預覽行:挑第一個「像樣的描述」——跳過純 hashtag(body 開頭常是 #標籤)與太短的碎片(如「出租】」),
+// 都找不到才退回第一個非空行。
+function previewLine(text) {
+  const lines = (text || '').split('\n').map((s) => s.trim()).filter(Boolean);
+  const good = lines.find((s) => !s.startsWith('#') && s.replace(/[#＃\s]/g, '').length >= 6);
+  return good || lines[0] || '';
+}
+
 function renderEntry(post, cls) {
   const head = cls.verdict === 'match' ? '✅' : '〽️';
   const tag = cls.verdict === 'match' ? cls.search : `${cls.search}(待確認)`;
   const lines = [`### ${head} [${tag}]`];
   if (cls.notes.length) lines.push(`- ${cls.notes.join(' · ')}`);
-  const firstLine = (post.text || '').split('\n').find((s) => s.trim()) || '';
-  lines.push(`- ${firstLine.slice(0, 80)}`);
+  lines.push(`- ${previewLine(post.text).slice(0, 80)}`);
   if (post.permalink) lines.push(`- 貼文:${post.permalink}`);
-  if (post.author) lines.push(`- 發文者:${post.author}`);
+  else if (post.author) lines.push(`- 發文者:${post.author}`); // 抓不到貼文連結才退回作者頁
   return lines.join('\n');
 }
 
-// scan 檔用:每篇貼文都列,標出判定結果(含被拒原因)
-function renderScanEntry(post, cls) {
-  const icon = { match: '✅', uncertain: '〽️', reject: '⛔' }[cls.verdict];
-  const tail = cls.verdict === 'reject'
-    ? (cls.reasons.join(' · ') || '不符')
-    : (cls.notes.join(' · ') || cls.search);
-  const firstLine = (post.text || '').split('\n').find((s) => s.trim()) || '';
-  const lines = [`### ${icon} ${cls.search} — ${firstLine.slice(0, 60)}`, `- ${tail}`];
-  if (post.permalink) lines.push(`- 貼文:${post.permalink}`);
-  if (post.author) lines.push(`- 發文者:${post.author}`);
-  return lines.join('\n');
+// ── scan 資料層 (jsonl) / 篩選 ────────────────────────────────────────
+// scan-*.jsonl 是 SSOT(機器用):一篇貼文一行,含原始欄位 + 預存 meta + 社團名。
+// find-*.md 是人眼版,由 runFilter 從 jsonl 套當下 config 重生 —— 改 config 只要 --refilter,不必重爬。
+const scanJsonlPath = (dir, date) => path.join(dir, `scan-${date}.jsonl`);
+const findMdPath = (dir, date) => path.join(dir, `find-${date}.md`);
+
+function appendScanRecords(file, records) {
+  if (!records.length) return;
+  appendFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf-8');
+}
+function readScanRecords(file) {
+  if (!existsSync(file)) return [];
+  const out = [];
+  for (const line of readFileSync(file, 'utf-8').split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    try { out.push(JSON.parse(s)); } catch (e) { /* 跳過壞行 */ }
+  }
+  return out;
 }
 
-// 逐社團即時寫檔,中途 ctrl+c 也保留已掃完的社團。
-// 本次執行第一次寫某檔(state[key] 還 false):檔案不存在 → 建檔(含標題);
-// 已存在(同日重跑)→ 先補一段時間戳分隔。之後同檔只接續 append。
-function appendSection(filePath, title, section, state, key) {
-  if (state[key]) {
-    appendFileSync(filePath, `\n${section}\n`, 'utf-8');
-    return;
+// 讀 scan 記錄 → 套 config 篩選 → 依社團分組的命中清單 + 統計。不碰瀏覽器。
+function runFilter(records, searches) {
+  const groups = new Map(); // 社團名 → entry markdown[]
+  let match = 0, uncertain = 0;
+  for (const rec of records) {
+    const cls = classifyPost(rec, searches);
+    if (cls.verdict !== 'match' && cls.verdict !== 'uncertain') continue;
+    if (cls.verdict === 'match') match++; else uncertain++;
+    const g = rec.group || '(未分類)';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(renderEntry(rec, cls));
   }
-  state[key] = true;
-  if (existsSync(filePath)) {
-    const time = new Date().toTimeString().slice(0, 5);
-    appendFileSync(filePath, `\n---\n## ⏱ ${time} 重跑新增\n\n${section}\n`, 'utf-8');
-  } else {
-    writeFileSync(filePath, `${title}\n\n${section}\n`, 'utf-8');
-  }
+  return { groups, match, uncertain };
+}
+function writeFind(file, date, result) {
+  const blocks = [];
+  for (const [g, entries] of result.groups) blocks.push(`## ${g}\n\n${entries.join('\n\n')}`);
+  writeFileSync(file, `# 篩選命中 ${date}\n\n${blocks.join('\n\n')}\n`, 'utf-8');
 }
 
 async function isLoggedIn(page) {
@@ -383,6 +437,24 @@ async function main() {
   mkdirSync(PROFILE_DIR, { recursive: true });
   mkdirSync(path.join(ROOT, 'data'), { recursive: true });
   const cfg = loadConfig();
+
+  // ── refilter 模式:只讀現有 scan jsonl 重跑篩選,完全不開瀏覽器 ──
+  if (FLAGS.refilter) {
+    if (cfg.searches.length === 0) { console.error('fb-targets.yml 沒有 searches 條件。'); return; }
+    const date = FLAGS.refilterDate || new Date().toISOString().slice(0, 10);
+    const scanPath = scanJsonlPath(cfg.output_dir, date);
+    const records = readScanRecords(scanPath);
+    if (!records.length) {
+      console.error(`找不到掃描資料:${scanPath}\n(先跑一次 node fb-scan.mjs 產生當天的 scan jsonl)`);
+      return;
+    }
+    const result = runFilter(records, cfg.searches);
+    const findPath = findMdPath(cfg.output_dir, date);
+    writeFind(findPath, date, result);
+    console.log(`重跑篩選 ${date}:讀 ${records.length} 篇 → ✅ 符合 ${result.match} · 〽️ 待確認 ${result.uncertain}`);
+    console.log(`→ 命中清單:${findPath}`);
+    return;
+  }
 
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: FLAGS.headless && !FLAGS.login,
@@ -407,14 +479,14 @@ async function main() {
     const date = new Date().toISOString().slice(0, 10);
     const seenFile = path.join(ROOT, cfg.dedup_file);
     const seen = loadSeen(seenFile);
-    const newKeys = [];
-    const findBlocks = []; // 命中(符合+待確認),僅供 --dry-run 彙總印出
-    let totalScraped = 0, totalNew = 0, totalMatch = 0, totalUncertain = 0;
+    const scanPath = scanJsonlPath(cfg.output_dir, date);
+    const findPath = findMdPath(cfg.output_dir, date);
+    // newKeys 同時擔任「當天 jsonl 已有的 key」——預載既有 jsonl,確保不論一般/renew 都不會寫重複行。
+    const newKeys = FLAGS.dryRun ? [] : readScanRecords(scanPath).map((r) => postKey(r));
+    const allRecords = []; // 本次新增的貼文(含 meta + group),交給 runFilter
+    let totalScraped = 0;
     let confirmed = false; // 只在第一個社團確認一次
 
-    const scanPath = path.join(cfg.output_dir, `scan-${date}.md`);
-    const findPath = path.join(cfg.output_dir, `find-${date}.md`);
-    const wrote = {}; // 本次執行已寫過哪些檔(給 appendSection 判斷建檔/重跑分隔)
     if (!FLAGS.dryRun) mkdirSync(cfg.output_dir, { recursive: true });
 
     // 優雅中斷:第一次 ctrl+c → 跑完目前社團、寫檔後才停;第二次 → 強制結束
@@ -446,50 +518,49 @@ async function main() {
       const posts = await scrapeGroup(page, group);
       totalScraped += posts.length;
 
-      const groupFinds = [];
-      const groupScans = [];
+      // scan 階段只負責「抓 + 抽 meta」,不做條件判斷 —— 判斷留給 runFilter。
+      const groupRecords = [];
       const groupKeys = [];
       for (const post of posts) {
         const key = postKey(post);
-        if (seen.has(key) || newKeys.includes(key)) continue; // 去重
+        if (newKeys.includes(key)) continue;            // 已在當天 jsonl / 本次已處理 → 不重複寫
+        if (!FLAGS.renew && seen.has(key)) continue;    // 跨次去重;--renew 時不擋,強制重拿(fb-seen 照樣記)
         newKeys.push(key); groupKeys.push(key);
-        totalNew++;
-        const cls = classifyPost(post, cfg.searches);
-        if (cls.verdict === 'match') totalMatch++;
-        else if (cls.verdict === 'uncertain') totalUncertain++;
-        groupScans.push(renderScanEntry(post, cls));
-        if (cls.verdict === 'match' || cls.verdict === 'uncertain') {
-          groupFinds.push(renderEntry(post, cls));
-        }
+        groupRecords.push({ ...post, group: group.name, meta: extractMeta(post) });
       }
-      if (groupFinds.length) findBlocks.push(`## ${group.name}\n\n${groupFinds.join('\n\n')}`);
-      console.log(`   抓到 ${posts.length} 篇,去重後新增 ${groupKeys.length},符合+待確認 ${groupFinds.length}`);
+      allRecords.push(...groupRecords);
+      console.log(`   抓到 ${posts.length} 篇,去重後新增 ${groupKeys.length}`);
 
-      // 逐社團即時寫檔 + 記去重,中途 ctrl+c 也保留已掃完的社團
+      // 逐社團即時寫 jsonl + 記去重,中途 ctrl+c 也保留已掃完的社團資料
       if (!FLAGS.dryRun) {
-        if (groupScans.length) appendSection(scanPath, `# 掃描全紀錄 ${date}`, `## ${group.name}\n\n${groupScans.join('\n\n')}`, wrote, 'scan');
-        if (groupFinds.length) appendSection(findPath, `# 篩選命中 ${date}`, `## ${group.name}\n\n${groupFinds.join('\n\n')}`, wrote, 'find');
+        appendScanRecords(scanPath, groupRecords);
         appendSeen(seenFile, groupKeys, date);
       }
     }
 
+    // ── 篩選階段:從本次蒐集的記錄套 config → find-*.md ──
+    const result = runFilter(allRecords, cfg.searches);
     console.log(`\n${'━'.repeat(40)}`);
     console.log(`掃描完成 ${date}`);
     console.log(`  總抓取:${totalScraped} 篇`);
-    console.log(`  去重後新貼文:${totalNew} 篇`);
-    console.log(`  ✅ 符合:${totalMatch} · 〽️ 待確認:${totalUncertain}`);
+    console.log(`  去重後新貼文:${allRecords.length} 篇`);
+    console.log(`  ✅ 符合:${result.match} · 〽️ 待確認:${result.uncertain}`);
 
     if (FLAGS.dryRun) {
       console.log('\n(--dry-run,不寫檔)\n');
-      if (findBlocks.length) console.log(findBlocks.join('\n\n'));
-      else console.log('(無命中物件)');
+      const blocks = [];
+      for (const [g, entries] of result.groups) blocks.push(`## ${g}\n\n${entries.join('\n\n')}`);
+      console.log(blocks.length ? blocks.join('\n\n') : '(無命中物件)');
       return;
     }
 
-    // 寫檔與去重都已在各社團逐一完成,這裡只回報結果
-    if (wrote.scan) console.log(`\n→ 全紀錄:${scanPath}`);
-    if (wrote.find) console.log(`→ 命中清單:${findPath}`);
-    else console.log('\n沒有新的符合物件。');
+    if (allRecords.length) console.log(`\n→ 掃描資料:${scanPath}`);
+    if (result.match || result.uncertain) {
+      writeFind(findPath, date, result);
+      console.log(`→ 命中清單:${findPath}`);
+    } else {
+      console.log('\n沒有新的符合物件。');
+    }
   } finally {
     await context.close();
   }
