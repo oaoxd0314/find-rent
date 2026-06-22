@@ -35,31 +35,49 @@ node fb-scan.mjs --refilter      # 不爬,只用當天既有資料重跑篩選
 ## 運作方式
 
 ```
-scan(爬 + 抽 meta) ──▶ scan-YYYY-MM-DD.jsonl   資料層(機器用)
-                  └──▶ filter(套 config) ──▶ find-YYYY-MM-DD.md   人眼版
+scan(爬 + 抽 meta) ──▶ scan-YYYY-MM-DD.jsonl   資料層
+                  └──▶ filter(套 config) ──▶ find-YYYY-MM-DD.md
 ```
 
 - 篩選與爬取分離:改條件只要 `--refilter`,不必重爬。
 - 去重記在 `data/fb-seen.tsv`,看過的不重列;清空重評全部:`rm data/fb-seen.tsv`。
 
-輸出在 config 的 `output_dir`(預設 `output/`):
-
-- `scan-*.jsonl` — 當天去重後的貼文 + 抽好的 meta,可重複篩選。
-- `find-*.md` — 命中清單,依判定由好到差分區:
-  - `符合` — include 條件全中。
-  - `待確認` — 沒被排除,但某些 include 沒滿足(租金/格局/地點/設備)。
-  - `性別待確認` — 偵測到男性訊號(`roommate_male` 條件用)。
-  - 命中 exclude、買賣文、求租文 → 直接排除,不進 find(仍保留在 jsonl)。
-
-## 設定
+## 權重判定與設定
 
 編輯 `config/fb-targets.yml`:
 
 - `groups:` — 社團清單。`enabled: false` 暫停某個;`scroll:` 控制抓取量。
-- `searches:` — 一或多組條件,每篇貼文比對所有組、取最佳結果:
-  - `include:` `rent_min` / `rent_max` / `layout` / `locations` / `must_have` — 軟條件,沒中只降「待確認」,不丟掉。
-  - `exclude:` `keywords` / `locations` — 命中就排除;`roommate_male: true` — 偵測男室友/限男 → 性別待確認。
-  - `optional:` — 加分項,只在命中時標註。
+- `searches:` — 一或多組條件,每篇貼文比對所有組、取最佳結果。
+
+判定 = **GATE(門檻)+ SCORE(評分排序)**(借鑑 career-ops):先用保守門檻丟掉明確不合的,其餘評分排序、不丟。
+
+- **GATE**(命中就排除):`exclude` 任一欄位、買賣/求租文、租金整段超出範圍。
+- **SCORE**:每命中一欄 → include 計 2 分、optional 計 1 分。
+- **分層**:`include` 全中 → `符合`;否則 score≥1 → `待確認`(按分排序);零命中 → 不顯示。
+
+三個 block 共用欄位(`layout`/`locations`/`keywords`/`must_have`;`rent_min`/`rent_max` 只放 include):
+
+- `include:` — 全中才算 `符合`;每命中一欄加分。
+- `optional:` — 不影響 `符合`,命中只加分(把零命中救成 `待確認`、並往前排)。
+- `exclude:` — 任一命中就排除。另 `roommate_female: true` →偵測到男 → `性別待確認`、女生友善 → 加分。
+
+欄位語意:`layout`/`locations`/`keywords` 出現任一即命中;`must_have` 須全部出現;`rent` 落在區間(沒寫租金 → 放行)。範例:
+
+```yaml
+searches:
+  - name: "整層住家"
+    include:                 # 全中 → 符合
+      rent_min: 10000
+      rent_max: 33000
+      layout: ["兩房一廳"]
+      locations: ["信義", "大安"]
+    optional:                # 加分:沒全中也能進待確認、命中越多排越前
+      layout: ["一房一廳"]
+      keywords: ["陽台", "洗衣機"]
+    exclude:                 # 任一命中就丟掉
+      keywords: ["頂加", "出售文"]
+      locations: ["三重"]
+```
 
 ## 定時自動跑(launchd,選用)
 

@@ -9,10 +9,18 @@
     "scan:log": "node fb-scan.mjs --yes 2>&1 | tee fb-scan.log",
     "fb-login": "node fb-scan.mjs --login",
     "dry": "node fb-scan.mjs --dry-run",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "postinstall": "npx playwright install chromium"
+  },
+  "jest": {
+    "transform": {},
+    "testMatch": ["**/*.test.js"]
   },
   "dependencies": {
     "js-yaml": "^4.1.1",
     "playwright": "^1.61.0"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2"
   }
 }

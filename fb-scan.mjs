@@ -102,7 +102,13 @@ export function parseRents(text) {
   const generic = new Set(); // 其他疑似金額(萬、$ 前綴…)
   const valid = (n) => Number.isFinite(n) && n >= 3000 && n <= 300000;
   const num = (s) => parseInt(String(s).replace(/,/g, ''), 10);
-  const add = (set, n) => { if (valid(n)) set.add(n); };
+  // 租金補貼「後」的金額要排除,列原價(例:「一人入住NT$17,800(租補後NT$12,200)」只留 17,800)。
+  // 標記須緊接金額(允許 NT$/元/括號),純 hashtag「#租金補貼」沒帶數字 → 不會誤抓。
+  const subsidized = new Set();
+  for (const m of t.matchAll(/(?:租金補貼後|租補後|補貼後|補助後|補後|租補)\s*[(（]?\s*(?:NT\$|NTD|\$|元)?\s*(\d[\d,]{2,})/g)) {
+    subsidized.add(num(m[1]));
+  }
+  const add = (set, n) => { if (valid(n) && !subsidized.has(n)) set.add(n); };
 
   // 標籤型:租金/月租/房租 後接金額,可為區間 X-Y(兩端都收)
   for (const m of t.matchAll(/(?:租金|月租|房租)[^\d]{0,8}(\d[\d,]{2,})(?:\s*-\s*(\d[\d,]{2,}))?/g)) {
@@ -149,6 +155,22 @@ function matchLayout(text, kw, haveBedrooms) {
     return null;
   }
   return text.includes(core) ? core : null;
+}
+
+// ── 地點精準比對 ─────────────────────────────────────────────────────
+// 純 substring 會誤判:「東森房屋木新店」把「新店」黏在複合詞裡。
+// 只在地名出現於「地名情境」時才算命中:
+//   - 後接地名後綴(信義區 / 新店路 / 松山站 / 信義商圈),或
+//   - 前面是行首 / 標點 / 空白 / 方位詞 / 標籤(在新店 / 近新店 / #信義 / 地址:大安)。
+// 「木新店」的「新」前面是「木」(非邊界)、後面是「或」(非後綴)→ 不命中。
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const PLACE_SUFFIX = '區|路|街|段|巷|弄|里|村|站|捷運|夜市|商圈|生活圈|公園';
+const PLACE_PREFIX = '地址|地點|位置|區域|社區|位於|鄰近|靠近|近|在|到|往|住|＃|#';
+export function matchLocation(full, loc) {
+  if (!loc) return false;
+  const L = escapeRe(loc);
+  return new RegExp(`${L}(?:${PLACE_SUFFIX})`).test(full)
+    || new RegExp(`(?:^|[\\s,，。、:：;；/／()（）「」【】〔〕\\[\\]\\-—~〜·]|${PLACE_PREFIX})${L}`, 'm').test(full);
 }
 
 // ── 買賣文偵測 ───────────────────────────────────────────────────────
@@ -203,108 +225,142 @@ export function extractMeta(post) {
   };
 }
 
-// 回傳針對「一組條件」的判定:{ verdict: 'match'|'uncertain'|'reject', reasons, notes }
-// 判定哲學:
-//   - 命中 exclude(關鍵字/地點)或買賣/求租文 → reject(唯一會被踢掉的情況)
-//   - include 條件(地點/租金/格局/must_have)全符合 → match
-//   - 沒命中 exclude,但 include 有缺 → uncertain(待確認,留給人工看)
-// 也就是 include 全是「軟條件」:不滿足只降級待確認,不再直接 reject。
-// meta 一律用當前 code 從 text 重新推導(不信 jsonl 裡的快取)——
-// 這樣調整偵測邏輯後 --refilter 會立刻反映,不必重爬;jsonl 的 meta 只供人工檢視。
+// ── 統一條件 schema(評分用)─────────────────────────────────────────
+// include / exclude / optional 三個 block 共用同一套欄位,差別只在怎麼收結果:
+//   exclude  → OR:任一命中就 reject(門檻)
+//   include  → 全中才算 ✅;每命中一欄 +分
+//   optional → 不影響 ✅;命中只 +分(把貼文從「零命中被丟」救成 〽️,並往前排)
+// 欄位 schema(每個都可省略):
+//   layout: []     格局,符合任一即命中(房間數語意比對)
+//   locations: []  地點,出現任一即命中(substring)
+//   keywords: []   關鍵字,出現任一即命中(substring)
+//   must_have: []  設備,須全部出現才算命中(AND within)
+// rent_min/rent_max 不在這裡 —— 它是「保守門檻」(見 rentGate):抓到且整段超出才 reject。
+function evalFields(block, meta, text, full) {
+  const out = [];
+  if (block.layout?.length) {
+    let core = null;
+    for (const kw of block.layout) { const h = matchLayout(text, kw, meta.bedrooms); if (h) { core = h; break; } }
+    out.push({ key: 'layout', hit: !!core, which: core,
+      note: core ? `格局:${core}` : `格局?不符(要 ${block.layout.join('/')})` });
+  }
+  if (block.locations?.length) {
+    const which = block.locations.find((loc) => matchLocation(full, loc));
+    out.push({ key: 'locations', hit: !!which, which,
+      note: which ? `地點:${which}` : `地點?不在範圍(要 ${block.locations.join('/')})` });
+  }
+  if (block.keywords?.length) {
+    const which = block.keywords.find((kw) => full.includes(kw));
+    out.push({ key: 'keywords', hit: !!which, which, note: which ? `關鍵字:${which}` : null });
+  }
+  if (block.must_have?.length) {
+    const missing = block.must_have.filter((n) => !full.includes(n));
+    out.push({ key: 'must_have', hit: missing.length === 0, which: null,
+      note: missing.length ? `${missing.join('/')}?(未提及)` : `${block.must_have.join('/')} ✓` });
+  }
+  return out;
+}
+
+// 租金門檻(保守):抓到租金且「整段」超出 include 的 [min,max] → 'out'(reject);
+// 落在範圍 → 'in';沒抓到 → 'unknown'(放行,不罰);沒設租金 → 'none'。
+function rentGate(inc, meta) {
+  if (inc.rent_min == null && inc.rent_max == null) return { state: 'none', note: null };
+  const min = inc.rent_min ?? 0, max = inc.rent_max ?? Infinity;
+  const rents = meta.rents || [];
+  if (!rents.length) return { state: 'unknown', note: '租金未明' };
+  const hit = rents.find((r) => r >= min && r <= max);
+  const range = `${min || 0}~${max === Infinity ? '∞' : max}`;
+  if (hit) return { state: 'in', note: `租金 ${hit.toLocaleString()}` };
+  return { state: 'out', note: `租金 ${rents.map((r) => r.toLocaleString()).join('/')}(超出 ${range})` };
+}
+
+// 回傳判定:{ verdict: 'match'|'uncertain'|'gender'|'reject', score, reasons, notes }
+// 借鑑 career-ops:GATE(保守二元)+ SCORE(評分排序)分開。
+//   GATE:買賣/求租文、exclude 命中、租金整段超出、地點/格局不在允許範圍 → reject(其餘放行)
+//        (地點/格局是定義性屬性,allowed = include ∪ optional;有設定且全不中 → 丟)
+//   SCORE:數命中幾欄(include 每欄 2 分、optional 每欄 1 分)
+//   TIER:include 全中 → match;否則 score≥1 → uncertain(按分排序);score=0 → drop
+//   GENDER:roommate_female / roommate_male 偵測到男性 → 該筆改標 gender(獨立軸,不丟)
+// meta 一律用當前 code 從 text 重新推導(不信 jsonl 快取),改偵測邏輯 --refilter 立即反映。
 export function evaluateSearch(post, search) {
   const text = post.text || '';
   const full = post.rawText || post.text || '';
   const meta = extractMeta(post);
   const inc = search.include || {};
   const exc = search.exclude || {};
-  const reasons = [];
+  // optional 容許舊的扁平陣列寫法(視為 keywords),也容許新的 block schema
+  const opt = Array.isArray(search.optional) ? { keywords: search.optional } : (search.optional || {});
   const notes = [];
-  let uncertain = false; // 任一 include 條件沒滿足就降級待確認
-  let genderFlag = false; // 偵測到男性訊號(roommate_male)→ 獨立的 gender 層級,不靜默丟掉
+  const rej = (reason) => ({ verdict: 'reject', score: 0, reasons: [reason], notes });
 
-  // 0) 買賣文 / 求租文 → 直接 reject(租屋社團常混入售屋、仲介、找房文)
-  if (meta.isSale) return { verdict: 'reject', reasons: ['買賣文(非租屋)'], notes };
-  if (meta.isWanted) return { verdict: 'reject', reasons: ['求租文(非出租)'], notes };
+  // ── GATE(保守:只在明確不合時 reject)──
+  if (meta.isSale) return rej('買賣文(非租屋)');
+  if (meta.isWanted) return rej('求租文(非出租)');
+  for (const f of evalFields(exc, meta, text, full)) {
+    if (!f.hit) continue;
+    const reason = f.key === 'locations' ? `排除地點:${f.which}`
+      : f.key === 'layout' ? `排除格局:${f.which}` : `排除關鍵字:${f.which}`;
+    return rej(reason);
+  }
+  const rent = rentGate(inc, meta);
+  if (rent.note) notes.push(rent.note);
+  if (rent.state === 'out') return rej(rent.note);
 
-  // 1) 排除條件 → 直接 reject(keywords 與 locations 都檢查)—— 唯一的硬性踢除
-  for (const kw of exc.keywords || []) {
-    if (full.includes(kw)) return { verdict: 'reject', reasons: [`排除關鍵字:${kw}`], notes };
+  // 地點門檻:include.locations ∪ optional.locations 非空時,沒命中任一 → drop(在不要的區域)
+  const allowedLocs = [...(inc.locations || []), ...(opt.locations || [])];
+  if (allowedLocs.length && !allowedLocs.some((loc) => matchLocation(full, loc))) {
+    return rej(`地點不在允許範圍(${allowedLocs.join('/')})`);
   }
-  for (const loc of exc.locations || []) {
-    if (full.includes(loc)) return { verdict: 'reject', reasons: [`排除地點:${loc}`], notes };
-  }
-  // 室友性別:exclude.roommate_male=true(女生友善)時,偵測到男性訊號 → 標 gender(待性別確認)
-  // 不直接 reject,避免積極偵測的誤判被靜默丟掉;其餘 include 條件照常算,notes 一起帶出來。
-  if (exc.roommate_male && meta.maleSignal) {
-    genderFlag = true;
-    notes.push('🚻 偵測到男性訊號');
-  }
-
-  // 1b) 指定地點:沒命中 → 待確認(不 reject)
-  const incLocs = inc.locations || [];
-  if (incLocs.length) {
-    const hitLoc = incLocs.find((loc) => full.includes(loc));
-    if (hitLoc) notes.push(`地點:${hitLoc}`);
-    else { uncertain = true; notes.push(`地點?不在範圍(要 ${incLocs.join('/')})`); }
+  // 格局門檻:include.layout ∪ optional.layout 非空時,沒命中任一 → drop
+  // (套房不該出現在「兩房一廳」的條件底下;格局是定義性屬性,跟地點一樣當門檻)
+  const allowedLayouts = [...(inc.layout || []), ...(opt.layout || [])];
+  if (allowedLayouts.length && !allowedLayouts.some((kw) => matchLayout(text, kw, meta.bedrooms))) {
+    return rej(`格局不符(要 ${allowedLayouts.join('/')})`);
   }
 
-  // 2) 租金:超出範圍或抓不到 → 待確認(不 reject)
-  const rents = meta.rents || [];
-  const min = inc.rent_min ?? 0;
-  const max = inc.rent_max ?? Infinity;
-  if (rents.length) {
-    const hit = rents.find((r) => r >= min && r <= max);
-    if (hit) notes.push(`租金 ${hit.toLocaleString()}`);
-    else { uncertain = true; notes.push(`租金?不在 ${min || 0}~${max === Infinity ? '∞' : max}(抓到 ${rents.map((r) => r.toLocaleString()).join('/')})`); }
-  } else {
-    uncertain = true; notes.push('租金未明');
+  // ── 室友性別(獨立軸):roommate_female(或舊的 exclude.roommate_male)──
+  let genderFlag = false, femalePlus = false;
+  if (opt.roommate_female === true || exc.roommate_male === true) {
+    if (meta.maleSignal) { genderFlag = true; notes.push('🚻 偵測到男性訊號'); }
+    else if (meta.femaleOnly || meta.femaleRoommates) { femalePlus = true; notes.push('⭐ 室友女生友善'); }
   }
 
-  // 3) 格局:沒命中 → 待確認(不 reject)
-  const layouts = inc.layout || [];
-  let coreLayout = null;
-  if (layouts.length) {
-    for (const kw of layouts) {
-      const hit = matchLayout(text, kw, meta.bedrooms);
-      if (hit) { coreLayout = hit; break; }
-    }
-    if (coreLayout) notes.push(`格局:${coreLayout}`);
-    else { uncertain = true; notes.push(`格局?不符(要 ${layouts.join('/')})`); }
+  // ── SCORE ──
+  let includeHits = 0, includeTotal = 0, optionalHits = 0;
+  for (const f of evalFields(inc, meta, text, full)) {
+    includeTotal++;
+    notes.push(f.note);
+    if (f.hit) includeHits++;
   }
-
-  // 室友皆女:純裝飾性標註,不影響判定(女生友善的硬性踢除已在 exclude.roommate_male 處理)
-  if (meta.femaleRoommates) notes.push('室友皆女 ✓');
-
-  // 4) must_have(缺則 uncertain — 貼文常省略)
-  for (const need of inc.must_have || []) {
-    if (text.includes(need)) notes.push(`${need} ✓`);
-    else { uncertain = true; notes.push(`${need}?(未提及)`); }
+  for (const f of evalFields(opt, meta, text, full)) {
+    if (f.hit) { optionalHits++; notes.push(`+${f.note}`); }
   }
+  if (femalePlus) optionalHits++; // 女生友善偏好命中也算一個 optional 加分
 
-  // 5) preference / 女生限定(軟條件,加註)
-  if (meta.femaleOnly) notes.push('⭐限女生');
-  else if (meta.notFemaleOnly && (inc.preference || []).length) notes.push('註:不限男女');
+  const includeOk = includeHits === includeTotal; // 無 include 欄位 → 0===0 → 視為全中
+  const score = includeHits * 2 + optionalHits;
 
-  // 6) optional(軟條件,只報告)
-  for (const opt of search.optional || []) {
-    if (text.includes(opt)) notes.push(`+${opt}`);
-  }
+  // ── TIER ──
+  let verdict;
+  if (includeOk) verdict = 'match';
+  else if (score >= 1) verdict = 'uncertain';
+  else return rej('零命中');
+  if (genderFlag) verdict = 'gender'; // 相關但偵測到男 → 改標 🚻(已過 score 門檻)
 
-  if (genderFlag) return { verdict: 'gender', reasons, notes };
-  return { verdict: uncertain ? 'uncertain' : 'match', reasons, notes };
+  return { verdict, score, reasons: [], notes };
 }
 
-// classifyPost 取最佳判定的排序:match > gender > uncertain > reject。
-// gender 高於 uncertain,否則男訊號貼文會被其他條件的 uncertain 蓋掉、浮不上 🚻 區。
+// classifyPost 取最佳判定的排序:match > gender > uncertain > reject;同層再比 score。
 const VERDICT_RANK = { match: 4, gender: 3, uncertain: 2, reject: 1 };
 
-// 把一篇貼文跑過所有條件,回傳最佳結果
-function classifyPost(post, searches) {
+// 把一篇貼文跑過所有條件,回傳最佳結果(層級優先,同層比 score)
+export function classifyPost(post, searches) {
   let best = null;
   for (const s of searches) {
     const r = evaluateSearch(post, s);
     const rank = VERDICT_RANK[r.verdict];
-    if (!best || rank > best.rank) best = { ...r, rank, search: s.name };
+    const better = !best || rank > best.rank || (rank === best.rank && (r.score || 0) > (best.score || 0));
+    if (better) best = { ...r, rank, search: s.name };
     if (r.verdict === 'match') break;
   }
   return best;
@@ -438,11 +494,11 @@ function runFilter(records, searches) {
   for (const rec of records) {
     const cls = classifyPost(rec, searches);
     if (!tiers[cls.verdict]) continue; // 只收 match/uncertain/gender
-    tiers[cls.verdict].push({ group: rec.group || '(未分類)', md: renderEntry(rec, cls) });
+    tiers[cls.verdict].push({ group: rec.group || '(未分類)', score: cls.score || 0, md: renderEntry(rec, cls) });
   }
   return { tiers, match: tiers.match.length, uncertain: tiers.uncertain.length, gender: tiers.gender.length };
 }
-// find 檔:依層級分區(✅→〽️→🚻),每區內再按社團排序。
+// find 檔:依層級分區(✅→〽️→🚻),每區內按 score 高到低排(同分再按社團)。
 function writeFind(file, date, result) {
   const out = [
     `# 篩選命中 ${date}`,
@@ -452,7 +508,7 @@ function writeFind(file, date, result) {
   for (const tier of FIND_TIERS) {
     const entries = result.tiers[tier];
     if (!entries.length) continue;
-    entries.sort((a, b) => a.group.localeCompare(b.group, 'zh-Hant'));
+    entries.sort((a, b) => b.score - a.score || a.group.localeCompare(b.group, 'zh-Hant'));
     out.push('', TIER_TITLE[tier], '', entries.map((e) => e.md).join('\n\n'));
   }
   writeFileSync(file, out.join('\n') + '\n', 'utf-8');

@@ -17,65 +17,67 @@ groups:
   #   scroll: 20
 
 # ── 2. 條件 list ─────────────────────────────────────────
-# 每篇貼文分別比對每組,符合任一組就留下,並標註命中哪組。
-#   include  = 硬條件(租金 / 格局必須符合)
-#   exclude.keywords  = 命中就丟掉(物件特徵,如頂加 / 地下室 / 求租文)
-#   exclude.locations = 命中就丟掉(地名)
-#   must_have = 缺則標「待確認」(貼文常省略,不直接丟)
-#   optional  = 加分項,只報告
-#   preference = 軟條件(命中加註,如限女生)
+# 每篇貼文分別比對每組,取最佳結果。判定 = GATE(門檻)+ SCORE(評分排序):
+#   GATE(保守,只在明確不合時丟):買賣/求租文、exclude 命中、租金整段超出範圍
+#   SCORE:每命中一欄 → include 計 2 分、optional 計 1 分
+#   分層:include 全中 → ✅ 符合;否則 score≥1 → 〽️ 待確認(按分排序);零命中 → 不顯示
+#
+# 三個 block 共用欄位(每個都可省略):
+#   layout: []           格局,符合任一即命中(房型用房間數比對,1房1廳/2房1廳都認)
+#   locations: []        地點,出現任一即命中
+#   keywords: []         關鍵字,出現任一即命中
+#   must_have: []        設備,須全部出現才算命中
+#   rent_min / rent_max  (只放 include)租金落在 [min,max];整段超出 → 丟,沒寫 → 放行
+#   roommate_female: true (放 optional)偵測到男 → 🚻 性別待確認;女生友善訊號 → 加分
 #
 # 註:買賣文(出售/賞屋/1598萬…)與求租文(求租/求獨立套房/想找雅房…)
 #     fb-scan.mjs 已內建語意偵測自動擋掉,不必逐字列在 keywords。
-#     keywords 只放這些通用規則抓不到、你個人想額外排除的字。
 searches:
 
   - name: "條件1:整層住家"
-    include:
-      rent_max: 33000              # 租金上限(0 或省略 = 不限)
-      layout:                       # 格局(符合任一;房型用房間數比對,1房1廳/一房一廳/2房1廳都認)
+    include:                        # 全中 → ✅ 符合
+      rent_min: 10000
+      rent_max: 33000
+      layout:
         - "兩房一廳"
+      locations:
+        - "信義"
+        - "大安"
+    optional:                       # 加分:沒全中也能進 〽️、命中越多排越前
+      layout:
         - "一房一廳"
-      must_have:
+      keywords:
         - "陽台"
-    exclude:
+        - "洗衣機"
+        - "冰箱"
+    exclude:                        # 任一命中就丟掉
       keywords:
         - "頂加"
         - "頂樓加蓋"
         - "地下室"
-        - "求租"
-        - "求租文"
-        - "出售文"                    # 買賣文(內建偵測之外的保險)
         - "委託價"
-        - "尋找短期租屋"
-        - "尋找租屋"
       locations:
         - "三重"
         - "蘆洲"
-    optional:
-      - "洗衣機"
-      - "冰箱"
 
   - name: "條件2:女生友善"
     include:
-      rent_min: 10000              # 租金下限
-      rent_max: 15000              # 租金上限
+      rent_min: 10000
+      rent_max: 18000
       layout:
         - "套房"
-        - "雅房(室友皆女生)"
-      preference:
-        - "只租女生"                # 命中會標 ⭐限女生
+        - "雅房"
+      locations:
+        - "信義"
+        - "大安"
+    optional:
+      roommate_female: true         # 偵測到男 → 🚻 性別待確認;女生友善訊號 → 加分
     exclude:
       keywords:
         - "頂加"
         - "頂樓加蓋"
         - "地下室"
-        - "求租"
-        - "求租文"
-        - "出售文"
         - "委託價"
-        - "尋找短期租屋"
-        - "尋找租屋"
       locations:
         - "三重"
         - "蘆洲"
@@ -85,5 +87,5 @@ dedup_file: "data/fb-seen.tsv"
 
 # ── 4. 結果寫到哪 ─────────────────────────────────────────
 # 相對路徑 → 存在本專案 output/(已 gitignore)。也可填絕對路徑或 ~/...
-# 每天兩個檔:scan-YYYY-MM-DD.md(全部) / find-YYYY-MM-DD.md(命中)
+# 每天:scan-YYYY-MM-DD.jsonl(資料層) / find-YYYY-MM-DD.md(命中清單)
 output_dir: "output"
