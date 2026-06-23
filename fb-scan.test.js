@@ -4,6 +4,7 @@
 import {
   parseRents,
   matchLocation,
+  layoutScope,
   evaluateSearch,
   classifyPost,
 } from './fb-scan.mjs';
@@ -42,51 +43,81 @@ describe('matchLocation — 地點精準比對', () => {
   test('方位詞(在新店)', () => expect(matchLocation('在新店租屋', '新店')).toBe(true));
   test('hashtag(#信義區)', () => expect(matchLocation('#信義區 採光好', '信義')).toBe(true));
   test('商圈後綴(信義商圈)', () => expect(matchLocation('信義商圈生活機能佳', '信義')).toBe(true));
+  test('交通敘述「可直達內湖」不污染(地址在永和)', () =>
+    expect(matchLocation('【地址】永和區保平路236巷15弄\n可直達台大醫院、內湖科技園區等地', '內湖')).toBe(false));
+  test('地址欄位內命中(地址在內湖)', () =>
+    expect(matchLocation('【地址】內湖區成功路三段\n鄰近永和', '內湖')).toBe(true));
+  test('hashtag 命中(#永和 + 地址)', () =>
+    expect(matchLocation('#永和 #整層\n【地址】永和區保平路30巷', '永和')).toBe(true));
+  test('無地址欄位/hashtag → 退回全文', () =>
+    expect(matchLocation('信義商圈生活機能佳', '信義')).toBe(true));
 });
 
-describe('evaluateSearch — GATE(門檻,reject)', () => {
+describe('matchLayout — 格局欄位優先(經 evaluateSearch)', () => {
+  const S2real = {
+    name: '條件2',
+    include: { rent_min: 10000, rent_max: 18000, layout: ['套房'], locations: ['信義'] },
+    optional: { layout: ['雅房'] },
+    exclude: { keywords: [] },
+  };
+  const yafang = '格局：開放式空間（雅房）\n共1套房4雅房\n信義\n租金14000';
+  test('格局欄位是雅房 → 套房 include 不全中,降為 uncertain', () =>
+    expect(ev(yafang, S2real).verdict).toBe('uncertain'));
+  test('格局欄位是套房 → match', () =>
+    expect(ev('格局：獨立套房\n信義\n租金14000', S2real).verdict).toBe('match'));
+  test('layoutScope 抽格局欄位值', () =>
+    expect(layoutScope('格局：開放式空間（雅房）\n共1套房4雅房')).toBe('開放式空間（雅房）'));
+  test('無格局欄位 → 退回全文', () =>
+    expect(layoutScope('信義 套房出租 採光好')).toBe(null));
+});
+
+describe('evaluateSearch — GATE(唯一門檻:只有 exclude 會丟)', () => {
   test('exclude 關鍵字命中 → reject', () => expect(ev('信義 兩房一廳 頂加 租金20000', S1).verdict).toBe('reject'));
   test('exclude 地點命中 → reject', () => expect(ev('三重 兩房一廳 租金20000', S1).verdict).toBe('reject'));
-  test('買賣文 → reject', () => expect(ev('信義 兩房一廳 總價1500萬 出售', S1).verdict).toBe('reject'));
-  test('求租文 → reject', () => expect(ev('求租 信義 兩房一廳 預算20000', S1).verdict).toBe('reject'));
-  test('租金整段超出範圍 → reject', () => expect(ev('信義 兩房一廳 租金50000', S1).verdict).toBe('reject'));
-  test('地點門檻:不在 allowed(板橋)→ reject', () =>
-    expect(ev('板橋 兩房一廳 租金20000', S1).verdict).toBe('reject'));
-  test('租補後排除後原價超出 → reject(複合驗證)', () =>
-    // 月租20000、租補後16000;subsidy 排掉 16000 → 只剩 20000 > S2 上限 18000 → 擋掉
-    expect(ev('信義 套房 月租20000 租補後16000', S2).verdict).toBe('reject'));
+  test('買賣文不在 exclude → 不丟(要丟請把關鍵字寫進 exclude)', () => {
+    expect(ev('信義 兩房一廳 總價1500萬 出售 租金20000', S1).verdict).not.toBe('reject');
+    const withSale = { ...S1, exclude: { ...S1.exclude, keywords: [...S1.exclude.keywords, '出售'] } };
+    expect(ev('信義 兩房一廳 總價1500萬 出售 租金20000', withSale).verdict).toBe('reject');
+  });
+  test('求租文不在 exclude → 不丟', () =>
+    expect(ev('求租 信義 兩房一廳 預算20000 租金20000', S1).verdict).not.toBe('reject'));
+  test('租金超出範圍 → 不丟(只是租金那欄不加分)', () =>
+    expect(ev('信義 兩房一廳 租金50000', S1).verdict).not.toBe('reject'));
+  test('地點不在 allowed(板橋)→ 不丟,降為 uncertain', () =>
+    expect(ev('板橋 兩房一廳 租金20000', S1).verdict).toBe('uncertain'));
+  test('格局不符(套房進兩房一廳條件)→ 不丟,降為 uncertain', () =>
+    // 地點(大安)+租金(25500)命中 → 進待確認;格局那欄不加分而已
+    expect(ev('近大安森林捷運 套房 租金25500', S1).verdict).toBe('uncertain'));
 });
 
 describe('evaluateSearch — SCORE & TIER', () => {
-  test('include 全中 → match,分 = 2欄×2', () => {
+  test('include 全中 → match,分 = 3欄×2', () => {
     const r = ev('信義 兩房一廳 租金20000', S1);
     expect(r.verdict).toBe('match');
-    expect(r.score).toBe(4); // layout(2) + locations(2)
+    expect(r.score).toBe(6); // 租金(2) + layout(2) + locations(2)
   });
-  test('租金未明仍放行(保守)→ match', () => {
-    expect(ev('信義 兩房一廳', S1).verdict).toBe('match');
+  test('租金未明 → 非全中,降為 uncertain', () => {
+    const r = ev('信義 兩房一廳', S1);
+    expect(r.verdict).toBe('uncertain');
+    expect(r.score).toBe(4); // layout(2) + locations(2),租金未明不加分
   });
   test('部分符合 + optional 命中 → uncertain', () => {
     const r = ev('信義 一房一廳 陽台 洗衣機 租金20000', S1);
     expect(r.verdict).toBe('uncertain');
-    // locations 信義(2) + optional layout 一房一廳(1) + optional keywords 命中一次(1) = 4
-    expect(r.score).toBe(4);
+    // 租金(2) + locations 信義(2) + optional layout 一房一廳(1) + optional keywords 一次(1) = 6
+    expect(r.score).toBe(6);
   });
   test('待確認區內 score 排序:命中越多分越高', () => {
-    const more = ev('信義 一房一廳 陽台 租金20000', S1); // loc(2)+opt layout(1)+opt kw(1)=4
-    const less = ev('信義 一房一廳 租金20000', S1);        // loc(2)+opt layout(1)=3
+    const more = ev('信義 一房一廳 陽台 租金20000', S1); // 租金(2)+loc(2)+opt layout(1)+opt kw(1)=6
+    const less = ev('信義 一房一廳 租金20000', S1);        // 租金(2)+loc(2)+opt layout(1)=5
     expect(more.verdict).toBe('uncertain');
     expect(less.verdict).toBe('uncertain');
     expect(more.score).toBeGreaterThan(less.score);
   });
   test('零命中 → drop(reject)', () => {
-    // 無 location 門檻的條件,layout 與 optional 全不中 → score 0 → 不顯示
+    // 沒寫進 exclude、include/optional 也全不中 → score 0 → 不顯示
     const noLoc = { name: 'X', include: { layout: ['兩房一廳'] }, optional: { keywords: ['陽台'] } };
     expect(ev('套房出租 採光好', noLoc).verdict).toBe('reject');
-  });
-  test('格局門檻:套房不該進「兩房一廳」條件 → drop', () => {
-    // 即使地點(大安)命中,格局是套房 → 不在 allowed layout(兩房一廳/一房一廳)→ 丟
-    expect(ev('近大安森林捷運 套房 租金25500', S1).verdict).toBe('reject');
   });
 });
 
