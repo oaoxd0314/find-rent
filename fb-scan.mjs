@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // fb-scan.mjs — FB 社團爬取 + 規則篩選。
 // 資料流:scan(Playwright 抓貼文)→ scan-DATE.jsonl(SSOT)→ filter(套 config)→ find-DATE.md。
-// flags: --login --yes --headless --dry-run --refilter [date] --renew --count N
+// flags: --login --yes --headless --dry-run --refilter [date] --renew --count N --concurrency N
 // 行為契約看 fb-scan.test.js(那才是 spec)。
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
@@ -23,6 +23,7 @@ function flagValue(name) {
 }
 const FLAGS = {
   count: flagValue('--count'),
+  concurrency: flagValue('--concurrency'),
   login: args.includes('--login'),
   yes: args.includes('--yes'),
   headless: args.includes('--headless'),
@@ -499,8 +500,7 @@ async function main() {
     const findPath = findMdPath(cfg.output_dir, date);
     const newKeys = FLAGS.dryRun ? [] : readScanRecords(scanPath).map((r) => postKey(r));
     const allRecords = [];
-    let totalScraped = 0;
-    let confirmed = false;
+    const stats = { totalScraped: 0 };
 
     if (!FLAGS.dryRun) mkdirSync(cfg.output_dir, { recursive: true });
 
@@ -512,27 +512,10 @@ async function main() {
       console.log('\n⏹  收到中斷,跑完目前社團、寫檔後就停(再按一次 ctrl+c 強制結束)…');
     });
 
-    for (const group of cfg.groups) {
-      if (stopRequested) break;
-      console.log(`\n📍 ${group.name} — ${group.url}`);
-      await page.goto(group.url, { waitUntil: 'domcontentloaded' });
-      await sleep(2500);
-
-      if (!(await isLoggedIn(page))) {
-        console.error('⚠️  未登入 FB。請先執行:node fb-scan.mjs --login');
-        return;
-      }
-
-      if (!FLAGS.yes && !confirmed) {
-        await prompt('登入 OK?確認頁面已載入社團貼文後,按 Enter 開始爬(之後的社團不再詢問)…');
-        confirmed = true;
-      }
-
-      const scrolls = Number(FLAGS.count || group.scroll);
-      console.log(`   滾動抓取中(scroll=${scrolls})…`);
-      const posts = await scrapeGroup(page, scrolls);
-      totalScraped += posts.length;
-
+    // 把一個社團爬到的貼文吃進去:去重 → 暫存 → 落檔。
+    // 全程同步(無 await),所以多個 worker 平行呼叫也不會交錯/競態。
+    const ingest = (group, posts) => {
+      stats.totalScraped += posts.length;
       const groupRecords = [];
       const groupKeys = [];
       for (const post of posts) {
@@ -543,18 +526,72 @@ async function main() {
         groupRecords.push({ ...post, group: group.name, meta: extractMeta(post) });
       }
       allRecords.push(...groupRecords);
-      console.log(`   抓到 ${posts.length} 篇,去重後新增 ${groupKeys.length}`);
-
+      console.log(`   [${group.name}] 抓到 ${posts.length} 篇,去重後新增 ${groupKeys.length}`);
       if (!FLAGS.dryRun) {
         appendScanRecords(scanPath, groupRecords);
         appendSeen(seenFile, groupKeys, date);
       }
+    };
+
+    // 單一 page 依序爬完指定社團(序列 = 整份 groups;平行 = 該 worker 分到的那批)。
+    const scrapeGroups = async (groups, p) => {
+      for (const group of groups) {
+        if (stopRequested) break;
+        console.log(`\n📍 ${group.name} — ${group.url}`);
+        await p.goto(group.url, { waitUntil: 'domcontentloaded' });
+        await sleep(2500);
+        if (!(await isLoggedIn(p))) {
+          console.error(`⚠️  未登入 FB(${group.name})。請先執行:node fb-scan.mjs --login`);
+          stopRequested = true;
+          break;
+        }
+        const scrolls = Number(FLAGS.count || group.scroll);
+        console.log(`   滾動抓取中(scroll=${scrolls})…`);
+        ingest(group, await scrapeGroup(p, scrolls));
+      }
+    };
+
+    const concurrency = Math.max(1, Number(FLAGS.concurrency) || 1);
+    if (concurrency === 1) {
+      // 序列:沿用主 persistent context,保留首次互動確認(--yes 跳過)。
+      await page.goto(cfg.groups[0].url, { waitUntil: 'domcontentloaded' });
+      await sleep(2500);
+      if (!(await isLoggedIn(page))) {
+        console.error('⚠️  未登入 FB。請先執行:node fb-scan.mjs --login');
+        return;
+      }
+      if (!FLAGS.yes) {
+        await prompt('登入 OK?確認頁面已載入社團貼文後,按 Enter 開始爬…');
+      }
+      await scrapeGroups(cfg.groups, page);
+    } else {
+      // 平行:用主 context 確認登入並抽 storageState,再開 N 個獨立瀏覽器分批爬。
+      await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded' });
+      await sleep(2500);
+      if (!(await isLoggedIn(page))) {
+        console.error('⚠️  未登入 FB。請先執行:node fb-scan.mjs --login');
+        return;
+      }
+      const storageState = await context.storageState();
+      const buckets = Array.from({ length: concurrency }, () => []);
+      cfg.groups.forEach((g, i) => buckets[i % concurrency].push(g));
+      const active = buckets.filter((b) => b.length);
+      console.log(`\n🧵 平行模式:${active.length} 個瀏覽器,各分到 ${active.map((b) => b.length).join('/')} 個社團`);
+      await Promise.all(active.map(async (bucket) => {
+        const browser = await chromium.launch({ headless: FLAGS.headless });
+        try {
+          const wctx = await browser.newContext({ storageState, viewport: { width: 1280, height: 900 }, locale: 'zh-TW' });
+          await scrapeGroups(bucket, await wctx.newPage());
+        } finally {
+          await browser.close();
+        }
+      }));
     }
 
     const result = runFilter(allRecords, cfg.searches);
     console.log(`\n${'━'.repeat(40)}`);
     console.log(`掃描完成 ${date}`);
-    console.log(`  總抓取:${totalScraped} 篇`);
+    console.log(`  總抓取:${stats.totalScraped} 篇`);
     console.log(`  去重後新貼文:${allRecords.length} 篇`);
     console.log(`  ✅ 符合:${result.match} · 〽️ 待確認:${result.uncertain} · 🚻 性別待確認:${result.gender}`);
 
